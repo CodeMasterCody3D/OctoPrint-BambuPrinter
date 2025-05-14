@@ -1,3 +1,5 @@
+[install instructions/releases](https://github.com/CodeMasterCody3D/OctoPrint-BambuPrinter/releases/tag/0.1.8rc15)
+
 # OctoPrint-BambuPrinter
 
 This plugin is an attempt to connect BambuLab printers to OctoPrint. It's still a work in progress, and there may be bugs/quirks that you will have to work around while using the plugin and during development. 
