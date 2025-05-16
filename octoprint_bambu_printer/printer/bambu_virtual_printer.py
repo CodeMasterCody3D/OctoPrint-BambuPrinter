@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import collections
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import math
 from pathlib import Path
 import queue
@@ -11,7 +11,7 @@ import time
 from octoprint_bambu_printer.printer.file_system.cached_file_view import CachedFileView
 from octoprint_bambu_printer.printer.file_system.file_info import FileInfo
 from octoprint_bambu_printer.printer.print_job import PrintJob
-from pybambu import BambuClient, commands
+from octoprint_bambu_printer.printer.pybambu import BambuClient, commands
 import logging
 import logging.handlers
 
@@ -43,6 +43,7 @@ class BambuPrinterTelemetry:
     lastTempAt: float = time.monotonic()
     firmwareName: str = "Bambu"
     extruderCount: int = 1
+    ams_current_tray: int = 255
 
 
 # noinspection PyBroadException
@@ -64,6 +65,7 @@ class BambuVirtualPrinter:
         self._data_folder = data_folder
         self._last_hms_errors = None
         self._log = logging.getLogger("octoprint.plugins.bambu_printer.BambuPrinter")
+        self.ams_data = self._settings.get(["ams_data"])
 
         self._state_idle = IdleState(self)
         self._state_printing = PrintingState(self)
@@ -178,6 +180,14 @@ class BambuVirtualPrinter:
         device_data = self.bambu_client.get_device()
         print_job_state = device_data.print_job.gcode_state
         temperatures = device_data.temperature
+        # strip out extra data to avoid unneeded settings updates
+        ams_data = [{"tray": asdict(x).pop("tray", None)} for x in device_data.ams.data if x is not None]
+
+        if self.ams_data != ams_data:
+            self._log.debug(f"Recieveid AMS Update: {ams_data}")
+            self.ams_data = ams_data
+            self._settings.set(["ams_data"], ams_data)
+            self._settings.save(trigger_event=True)
 
         self.lastTempAt = time.monotonic()
         self._telemetry.temp[0] = temperatures.nozzle_temp
@@ -185,6 +195,12 @@ class BambuVirtualPrinter:
         self._telemetry.bedTemp = temperatures.bed_temp
         self._telemetry.bedTargetTemp = temperatures.target_bed_temp
         self._telemetry.chamberTemp = temperatures.chamber_temp
+        if device_data.push_all_data and "ams" in device_data.push_all_data:
+            self._telemetry.ams_current_tray = device_data.push_all_data["ams"]["tray_now"] or 255
+
+        if self._telemetry.ams_current_tray != self._settings.get_int(["ams_current_tray"]):
+            self._settings.set_int(["ams_current_tray"], self._telemetry.ams_current_tray)
+            self._settings.save(trigger_event=True)
 
         self._log.debug(f"Received printer state update: {print_job_state}")
         if (
@@ -214,6 +230,8 @@ class BambuVirtualPrinter:
 
     def on_disconnect(self, on_disconnect):
         self._log.debug(f"on disconnect called")
+        self.stop_continuous_status_report()
+        self.stop_continuous_temp_report()
         return on_disconnect
 
     def on_connect(self, on_connect):
@@ -241,24 +259,25 @@ class BambuVirtualPrinter:
             f"connecting via local mqtt: {self._settings.get_boolean(['local_mqtt'])}"
         )
         bambu_client = BambuClient(
-            device_type=self._settings.get(["device_type"]),
-            serial=self._settings.get(["serial"]),
-            host=self._settings.get(["host"]),
-            username=(
+            {"device_type": self._settings.get(["device_type"]),
+            "serial": self._settings.get(["serial"]),
+            "host": self._settings.get(["host"]),
+            "username": (
                 "bblp"
                 if self._settings.get_boolean(["local_mqtt"])
                 else self._settings.get(["username"])
             ),
-            access_code=self._settings.get(["access_code"]),
-            local_mqtt=self._settings.get_boolean(["local_mqtt"]),
-            region=self._settings.get(["region"]),
-            email=self._settings.get(["email"]),
-            auth_token=self._settings.get(["auth_token"]),
+            "access_code": self._settings.get(["access_code"]),
+            "local_mqtt": self._settings.get_boolean(["local_mqtt"]),
+            "region": self._settings.get(["region"]),
+            "email": self._settings.get(["email"]),
+            "auth_token": self._settings.get(["auth_token"]) if self._settings.get_boolean(["local_mqtt"]) is False else "",
+             }
         )
         bambu_client.on_disconnect = self.on_disconnect(bambu_client.on_disconnect)
         bambu_client.on_connect = self.on_connect(bambu_client.on_connect)
         bambu_client.connect(callback=self.new_update)
-        self._log.info(f"bambu connection status: {bambu_client.connected}")
+        self._log.debug(f"bambu connection status: {bambu_client.connected}")
         self.sendOk()
         self._bambu_client = bambu_client
 
@@ -309,48 +328,79 @@ class BambuVirtualPrinter:
     ##~~ project file functions
 
     def remove_project_selection(self):
+        self._log.debug("Removing project selection.")
         self._selected_project_file = None
+        # ** Add call to send message after deselection **
+        # This will make _send_file_selected_message send the "deselected" message
+        self._send_file_selected_message()
+        # Ensure _serial_io.reset() is *not* called here based on previous issues (and it's not in your current script)
+
+
 
     def select_project_file(self, file_path: str) -> bool:
-        self._log.debug(f"Select project file: {file_path}")
-        file_info = self._project_files_view.get_file_by_stem(
-            file_path, [".gcode", ".3mf"]
-        )
+        file_info = self._project_files_view.get_file_by_name(file_path)
         if (
             self._selected_project_file is not None
             and file_info is not None
             and self._selected_project_file.path == file_info.path
         ):
+            self._log.debug(f"File already selected: {file_path}")
             return True
 
         if file_info is None:
-            self._log.error(f"Cannot select not existing file: {file_path}")
+            self._log.error(f"Cannot select non-existent file: {file_path}")
             return False
+
+        self._log.debug(f"Select project file: {file_path}")
 
         self._selected_project_file = file_info
         self._send_file_selected_message()
         return True
 
-    ##~~ command implementations
 
     @gcode_executor.register_no_data("M21")
-    def _sd_status(self) -> None:
+    def _sd_status(self) -> bool:
         self.sendIO("SD card ok")
+        return True
 
     @gcode_executor.register("M23")
     def _select_sd_file(self, data: str) -> bool:
+        self._log.debug("M23 command received.")
         filename = data.split(maxsplit=1)[1].strip()
-        return self.select_project_file(filename)
+
+        # ** Step 1: Perform the deselection logic **
+        self._log.debug("Calling remove_project_selection as part of M23 handling.")
+        # Call the remove_project_selection method to clear any previous selection state
+        self.remove_project_selection()
+        # remove_project_selection will call _send_file_selected_message
+        # and send the explicit deselection messages over serial.
+
+        # Add a small delay here to allow OctoPrint's UI to potentially process
+        # the deselection messages before the selection messages arrive.
+        # This might help synchronize the UI state.
+        time.sleep(1) # Small delay (50 milliseconds)
+
+        # ** Step 2: Proceed with the original M23 selection logic **
+        self._log.debug(f"Proceeding with selection for filename: {filename}")
+        # Call the select_project_file method to set the new selection
+        # select_project_file will call _send_file_selected_message
+        # and send the selection messages for the new file.
+        success = self.select_project_file(filename)
+
+        # The "ok N+1" response for the M23 command is handled automatically
+        # by _process_gcode_serial_command after this method returns.
+
+        return success # Return whether the selection was successful
+
 
     def _send_file_selected_message(self):
         if self.selected_file is None:
             return
 
-        self.sendIO(
-            f"File opened: {self.selected_file.file_name}  "
-            f"Size: {self.selected_file.size}"
-        )
+        self.sendIO(f"File opened: {self.selected_file.dosname} Size: {self.selected_file.size}")
         self.sendIO("File selected")
+
+
 
     @gcode_executor.register("M26")
     def _set_sd_position(self, data: str) -> bool:
@@ -433,9 +483,14 @@ class BambuVirtualPrinter:
             self._print_temp_reporter.cancel()
             self._print_temp_reporter = None
 
+
+
     # noinspection PyUnusedLocal
     @gcode_executor.register_no_data("M115")
     def _report_firmware_info(self) -> bool:
+        # wait for connection to be established before sending back firmware info
+        while self.bambu_client.connected is False:
+            time.sleep(1)
         self.sendIO("Bambu Printer Integration")
         self.sendIO("Cap:AUTOREPORT_SD_STATUS:1")
         self.sendIO("Cap:AUTOREPORT_TEMP:1")
@@ -522,23 +577,163 @@ class BambuVirtualPrinter:
 
             gcode_command["print"]["param"] = speed_command
             if self.bambu_client.publish(gcode_command):
-                self._log.info(f"{percent}% speed adjustment command sent successfully")
+                self._log.debug(f"{percent}% speed adjustment command sent successfully")
         return True
+
+    @gcode_executor.register_no_data("M1111")
+    def _handle_m1111_refined_parse(self) -> bool: # Renamed
+        """
+        Custom debug command to report the real-time physical AMS status.
+        Reads cached data from self.ams_data based on confirmed structure
+        and outputs parsed data to the OctoPrint terminal.
+        """
+        self._log.debug("M1111 command received (refined parse). Reporting physical AMS status.")
+
+        # Read cached data directly from the self.ams_data attribute
+        cached_ams_data = self.ams_data
+
+        self._log.info("Reading cached AMS data from self.ams_data for refined parsing.")
+        # Log the raw data content to the log file as well
+        self._log.debug(f"REFINED_PARSE: Content of self.ams_data: {cached_ams_data}")
+
+
+        if not cached_ams_data or not isinstance(cached_ams_data, list):
+            self.sendIO("echo: No physical AMS tray data available in cache (self.ams_data is empty or malformed).\n")
+        else:
+            self.sendIO("echo: --- Physical AMS Status (Parsed from self.ams_data) ---\n")
+
+            # --- ADDITION START ---
+            # Output the raw cached data to the terminal for debugging
+            try:
+                # Use repr() to get a string representation that includes quotes for strings, etc.
+                raw_data_string = repr(cached_ams_data)
+                # Split into smaller chunks if needed, though sendIO might handle large strings.
+                # If it struggles with very large outputs, you might need chunking.
+                # For typical AMS data, sending as one string should be fine.
+                self.sendIO(f"echo: RAW self.ams_data content: {raw_data_string}\n")
+                self._log.debug("REFINED_PARSE: Sent raw data content to terminal.")
+            except Exception as e:
+                self._log.error(f"REFINED_PARSE: Error outputting raw data to terminal: {type(e).__name__}: {e}", exc_info=True)
+                self.sendIO(f"echo: Error outputting raw AMS data: {e}\n")
+            # --- ADDITION END ---
+
+
+            parsed_ams_trays = [] # List to hold parsed tray data before printing
+
+            try:
+                # Iterate through the top-level list (each item represents an AMS unit's data structure)
+                for unit_index, ams_unit_container in enumerate(cached_ams_data):
+                    self._log.debug(f"REFINED_PARSE: Processing AMS unit container {unit_index}. Content: {ams_unit_container}")
+                    # Check if the item is a dictionary and contains the 'tray' key which holds a list
+                    if (isinstance(ams_unit_container, dict)
+                            and 'tray' in ams_unit_container
+                            and isinstance(ams_unit_container['tray'], list)):
+
+                        # Access the list of trays directly from the 'tray' key
+                        ams_unit_trays = ams_unit_container['tray']
+                        self._log.debug(f"REFINED_PARSE: Found 'tray' list for unit {unit_index}. Number of trays: {len(ams_unit_trays)}")
+
+                        # Iterate through the list of individual trays for this unit
+                        for slot_index, tray in enumerate(ams_unit_trays):
+                            self._log.debug(f"REFINED_PARSE: Processing tray {slot_index} in unit {unit_index}. Content: {tray}")
+                            # Check if the tray is a dictionary and has 'type' and 'color' keys
+                            if tray and isinstance(tray, dict) and 'type' in tray and 'color' in tray:
+                                material = tray.get("type", "Unknown") # Key is 'type'
+                                color = tray.get("color", "00000000") # Key is 'color'
+
+                                # Calculate Global ID (assuming 4 slots per unit)
+                                # Global ID = (Unit Index * 4) + Slot Index
+                                global_id = (unit_index * 4) + slot_index # Use 4 slots per unit as typical
+
+                                # Process color: remove the last two characters (alpha channel)
+                                processed_color = color[:6] if color and len(color) >= 6 else "000000"
+
+                                parsed_ams_trays.append({
+                                    'global_id': global_id,
+                                    'type': material,
+                                    'color': processed_color,
+                                    'unit': unit_index,
+                                    'slot': slot_index
+                                })
+                                self._log.debug(f"REFINED_PARSE: Parsed tray Unit {unit_index}, Slot {slot_index}. Global ID: {global_id}, Type: {material}, Color: #{processed_color}")
+
+                            else:
+                                self._log.debug(f"REFINED_PARSE: Skipping malformed tray data (not dict or missing type/color) at Unit {unit_index}, Slot {slot_index}.")
+                    else:
+                        self._log.debug(f"REFINED_PARSE: Skipping malformed AMS unit container data (not dict or missing 'tray' list) at index {unit_index}.")
+
+            except Exception as e:
+                self._log.error(f"REFINED_PARSE: Error during cached data parsing: {type(e).__name__}: {e}", exc_info=True)
+                self.sendIO(f"echo: Error parsing cached AMS data: {e}\n")
+                parsed_ams_trays = [] # Clear list on error
+
+
+            # Now send the parsed data to the terminal
+            if parsed_ams_trays:
+                 for tray_data in parsed_ams_trays:
+                      output_line = (
+                           f"echo: AMS Unit {tray_data.get('unit', '?')}, Slot {tray_data.get('slot', '?')}"
+                           f" (Global ID: {tray_data.get('global_id', '?')})"
+                           f" - Type: {tray_data.get('type', 'Unknown')}, Color: #{tray_data.get('color', '000000')}\n" # Add # to color
+                      )
+                      self.sendIO(output_line)
+                      self._log.debug(f"REFINED_PARSE: Sent terminal output for Global ID {tray_data.get('global_id', '?')}.")
+            else:
+                 # This message will now be printed if the parsed_ams_trays list ends up empty
+                 # even if raw data was present, indicating a parsing failure.
+                 self.sendIO("echo: Parsed data list is empty (check raw data and logs for parsing errors).\n")
+
+
+            self.sendIO("echo: -----------------------------------------------------\n")
+
+        # Send the standard "ok N+1" response to acknowledge the command
+        try:
+            next_expected_line = self._serial_io.lastN + 1
+            self.sendIO(f"ok {next_expected_line}\n")
+        except Exception as e:
+             self._log.error(f"REFINED_PARSE: Error sending ok N+1: {type(e).__name__}: {e}", exc_info=True)
+
+        self._log.debug("M1111 command finished (refined parse).")
+        return True # Indicate the command was handled
+
 
     def _process_gcode_serial_command(self, gcode: str, full_command: str):
         self._log.debug(f"processing gcode {gcode} command = {full_command}")
+
+        # Execute the command handler
         handled = self.gcode_executor.execute(self, gcode, full_command)
+
+        # ** Modify the response sending logic **
+        # Regardless of whether it was handled by a local executor or sent via MQTT,
+        # we need to send an "ok" response back to OctoPrint via the simulated serial.
+        # This response should include the next expected line number.
+
+        # Get the next expected line number from PrinterSerialIO's state
+        # Make sure to access lastN via self._serial_io
+        next_expected_line = self._serial_io.lastN + 1
+
         if handled:
-            self.sendOk()
+            self._log.debug(f"G-code command {gcode} handled internally. Sending ok {next_expected_line}")
+            # Send "ok N+1" back to OctoPrint via PrinterSerialIO
+            self._serial_io.send(f"ok {next_expected_line}\n")
             return
 
-        # post gcode to printer otherwise
+        # If not handled by a local executor, post gcode to printer otherwise
         if self.bambu_client.connected:
             GCODE_COMMAND = commands.SEND_GCODE_TEMPLATE
             GCODE_COMMAND["print"]["param"] = full_command + "\n"
             if self.bambu_client.publish(GCODE_COMMAND):
-                self._log.info("command sent successfully")
-                self.sendOk()
+                self._log.debug(f"command {gcode} sent successfully via MQTT. Sending ok {next_expected_line}")
+                # Send "ok N+1" back to OctoPrint via PrinterSerialIO
+                self._serial_io.send(f"ok {next_expected_line}\n")
+            else:
+                self._log.warning(f"Failed to send command {gcode} via MQTT.")
+                # Optionally send an error response back to OctoPrint
+                # self._serial_io.send(f"Error: MQTT send failed for {gcode}\n")
+        else:
+             self._log.warning(f"Printer not connected, cannot send command {gcode} via MQTT.")
+             # Optionally send an error response back to OctoPrint
+             # self._serial_io.send(f"Error: Printer not connected, cannot execute {gcode}\n")
 
     @gcode_executor.register_no_data("M112")
     def _shutdown(self):
@@ -573,9 +768,22 @@ class BambuVirtualPrinter:
         self._current_state.pause_print()
         return True
 
+    @gcode_executor.register("M355")
+    def _case_lights(self, data: str) -> bool:
+        if data == "M355 S1":
+            light_command = commands.CHAMBER_LIGHT_ON
+        elif data == "M355 S0":
+            light_command = commands.CHAMBER_LIGHT_OFF
+        else:
+            return False
+
+        return self.bambu_client.publish(light_command)
+
     @gcode_executor.register("M524")
     def _cancel_print(self):
         self._current_state.cancel_print()
+        time.sleep(5)
+        self.remove_project_selection()
         return True
 
     def report_print_job_status(self):
@@ -601,8 +809,11 @@ class BambuVirtualPrinter:
             self.report_print_job_status()
             self.report_print_finished()
             self.current_print_job = None
+            self.remove_project_selection()
             self.report_print_job_status()
         self.change_state(self._state_idle)
+        time.sleep(5)
+        self.remove_project_selection()
 
     def _create_temperature_message(self) -> str:
         template = "{heater}:{actual:.2f}/ {target:.2f}"
@@ -648,7 +859,7 @@ class BambuVirtualPrinter:
         self._state_change_queue.join()
 
     def _printer_worker(self):
-        self._create_client_connection_async()
+        # self._create_client_connection_async()
         self.sendIO("Printer connection complete")
         while self._running:
             try:
@@ -671,6 +882,12 @@ class BambuVirtualPrinter:
 
         self._current_state.finalize()
         self._current_state = new_state
+
+        # Check if the new state is the IdleState (self._state_idle is the instance of IdleState)
+        if new_state == self._state_idle:
+            self._log.debug("Transitioned to Idle state. Applying cleanup delay and removing selection.")
+
+
         self._current_state.init()
 
     def _showPrompt(self, text, choices):
