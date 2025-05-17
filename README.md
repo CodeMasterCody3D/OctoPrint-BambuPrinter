@@ -12,4 +12,4 @@ This plugin is an attempt to connect BambuLab printers to OctoPrint. It's still 
 
 Install manually using this URL:
 
-    https://github.com/jneilliii/OctoPrint-BambuPrinter/archive/master.zip
+    https://github.com/CodeMasterCody3D/OctoPrint-BambuPrinter/archive/refs/heads/master.zip
