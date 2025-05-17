@@ -615,11 +615,11 @@ class BambuPrintPlugin(
             self._logger.error(f"An unexpected error occurred during slice_info.config parsing: {e}")
             return None
 
-
     def on_event(self, event, payload):
         if event == Events.TRANSFER_DONE:
             self._printer.commands("M20 L T", force=True)
         elif event == Events.FILE_ADDED:
+            # ... (your existing FILE_ADDED logic remains the same)
             if payload["operation"] == "add" and "3mf" in payload["type"]:
                 file_container = os.path.join(self._settings.getBaseFolder("uploads"), payload["path"])
                 if os.path.exists(file_container):
@@ -630,8 +630,8 @@ class BambuPrintPlugin(
 
                     try:
                          with zipfile.ZipFile(file_container) as zipObj:
-
-                            # --- Existing PNG and Plate JSON Extraction ---
+                             # ... (your existing 3mf extraction logic remains the same)
+                             # --- Existing PNG and Plate JSON Extraction ---
                             try:
                                 # extract thumbnail
                                 zipInfo = zipObj.getinfo("Metadata/plate_1.png")
@@ -653,7 +653,7 @@ class BambuPrintPlugin(
                                                                                    plate_data, overwrite=True)
                             except KeyError:
                                 # Original file not found error log
-                                self._logger.info(f"unable to extract plate_1.png or plate_1.json from 3mf file: {file_container}")
+                                self._logger.info(f"unable to extract from 3mf file: {file_container}")
                             except Exception as e:
                                 # Catch other errors during the original extraction
                                 self._logger.error(f"An error occurred during existing 3mf extraction (png/json) for {file_container}: {e}")
@@ -698,15 +698,45 @@ class BambuPrintPlugin(
 
 
         elif event == Events.UPLOAD:
-            if payload["target"] == "local" and payload["print"] in valid_boolean_trues:
+            # Check if the target is local or sdcard
+            if payload["target"] in ["local", "sdcard"]:
+                # Construct the full path to the file in OctoPrint's uploads folder
                 path = os.path.join(self._settings.getBaseFolder("uploads"), payload["path"])
+
                 filename = payload["name"]
-                with self._bambu_file_system.get_ftps_client() as ftp:
-                    if ftp.upload_file(path, filename):
-                        self._project_files_view.with_filter("", ".3mf")
-                        file_info = self._project_files_view.get_file_by_name(filename)
-                        if payload["print"] in valid_boolean_trues:
-                            self._printer.select_file(file_info.dosname, True, printAfterSelect=payload["print"] in valid_boolean_trues)
+
+                # Check if the file actually exists at the expected path before trying to upload
+                if os.path.exists(path):
+                    # Optional: Add a check here if you ONLY want to upload .3mf files via FTP
+                    if filename.lower().endswith(".3mf"):
+                        with self._bambu_file_system.get_ftps_client() as ftp:
+                            if ftp.upload_file(path, filename):
+                                self._logger.info(f"Successfully FTP uploaded {filename} from {path}")
+
+                                # *** Add this block to refresh the SD card list after an SD card upload ***
+                                if payload["target"] == "sdcard":
+                                     self._logger.info("Triggering SD card file list refresh (M20)")
+                                     self._printer.commands("M20")
+                                # ***********************************************************************
+
+                                # Reintroduce the logic to select and potentially print if the 'print' flag is true
+                                if payload.get("print") in valid_boolean_trues:
+                                    # Assuming the file is uploaded to the root of the printer's SD card with the same name
+                                    printer_file_path = filename # Adjust if files are uploaded to subfolders on the printer SD
+
+                                    self._logger.info(f"Attempting to select and print file on printer: {printer_file_path}")
+                                    # The select_file command needs the path on the printer's filesystem
+                                    # The second argument `True` means it's an SD file
+                                    self._printer.select_file(printer_file_path, True, printAfterSelect=True) # printAfterSelect should be True here
+
+                    else:
+                        self._logger.info(f"Skipping FTP upload for non-.3mf file: {filename} uploaded to {payload['target']}")
+                else:
+                     self._logger.error(f"Uploaded file not found at expected path: {path}")
+            else:
+                self._logger.info(f"Upload target is not local or sdcard: {payload.get('target')}. Skipping FTP upload.")
+
+
 
 
 
